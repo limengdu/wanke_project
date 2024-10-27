@@ -1,14 +1,14 @@
-#include <Adafruit_NeoPixel.h>
+#include <FastLED.h>
 
-#define NUM_LEDS 60
+#define NUM_LEDS 59
 #define LED_PIN D1
 
-// NeoPixel brightness, 0 (min) to 255 (max)
+// FastLED brightness, 0 (min) to 255 (max)
 #define BRIGHTNESS 255
 
-#define digital_pir_sensor D0 // connect to Pin 5
+#define digital_pir_sensor D0 // connect to 
 
-Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRBW + NEO_KHZ800);
+CRGB leds[NUM_LEDS];
 
 unsigned long lastMotionTime = 0;
 const unsigned long motionTimeout = 5000; // 5 seconds
@@ -25,19 +25,17 @@ void setAll(byte red, byte green, byte blue) {
 }
 
 void setPixel(int Pixel, byte red, byte green, byte blue) {
-  strip.setPixelColor(Pixel, strip.Color(red, green, blue));
+  leds[Pixel] = CRGB(red, green, blue);
 }
 
 void showStrip() {
-  strip.show();
+  FastLED.show();
 }
 
-void meteorRain(byte red, byte green, byte blue, byte meteorSize, byte meteorTrailDecay, boolean meteorRandomDecay, int SpeedDelay, bool rightToLeft) {  
+void meteorRain(byte meteorSize, byte meteorTrailDecay, boolean meteorRandomDecay, int SpeedDelay, bool rightToLeft) {  
   setAll(0,0,0);
  
   for(int i = 0; i < NUM_LEDS+NUM_LEDS; i++) {
-   
-   
     // fade brightness all LEDs one step
     for(int j=0; j<NUM_LEDS; j++) {
       if( (!meteorRandomDecay) || (random(10)>5) ) {
@@ -49,11 +47,11 @@ void meteorRain(byte red, byte green, byte blue, byte meteorSize, byte meteorTra
     for(int j = 0; j < meteorSize; j++) {
       if(rightToLeft) {
         if( ( i-j <NUM_LEDS) && (i-j>=0) ) {
-          setPixel(i-j, red, green, blue);
+          setPixel(i-j, random(256), random(256), random(256));
         }
       } else {
         if( ( i-j <NUM_LEDS) && (i-j>=0) ) {
-          setPixel(NUM_LEDS-1-(i-j), red, green, blue);
+          setPixel(NUM_LEDS-1-(i-j), random(256), random(256), random(256));
         }
       }
     }
@@ -64,27 +62,7 @@ void meteorRain(byte red, byte green, byte blue, byte meteorSize, byte meteorTra
 }
 
 void fadeToBlack(int ledNo, byte fadeValue) {
- #ifdef ADAFRUIT_NEOPIXEL_H
-    // NeoPixel
-    uint32_t oldColor;
-    uint8_t r, g, b;
-    int value;
-   
-    oldColor = strip.getPixelColor(ledNo);
-    r = (oldColor & 0x00ff0000UL) >> 16;
-    g = (oldColor & 0x0000ff00UL) >> 8;
-    b = (oldColor & 0x000000ffUL);
-
-    r=(r<=10)? 0 : (int) r-(r*fadeValue/256);
-    g=(g<=10)? 0 : (int) g-(g*fadeValue/256);
-    b=(b<=10)? 0 : (int) b-(b*fadeValue/256);
-   
-    strip.setPixelColor(ledNo, r,g,b);
- #endif
- #ifndef ADAFRUIT_NEOPIXEL_H
-   // FastLED
-   leds[ledNo].fadeToBlackBy( fadeValue );
- #endif  
+  leds[ledNo].fadeToBlackBy(fadeValue);
 }
 
 void randomFlicker() {
@@ -103,9 +81,8 @@ void setup()
 {
   Serial.begin(115200);  // set baud rate as 9600
   pinMode(digital_pir_sensor, INPUT); // set Pin mode as input
-  strip.begin();           // INITIALIZE NeoPixel strip object (REQUIRED)
-  strip.show();            // Turn OFF all pixels ASAP
-  strip.setBrightness(BRIGHTNESS);
+  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);
 }
 
 void loop()
@@ -116,11 +93,11 @@ void loop()
     motionCount++;
     if(motionCount >= motionCountThreshold) {
       // randomFlicker();
-      meteorRain(0xff, 0xff, 0xff, 10, 64, true, 30, meteorDirection);
+      meteorRain(10, 64, true, 15, meteorDirection);
       meteorDirection = !meteorDirection;
     } else {
       // meteorRain(0xff, 0xff, 0xff, 10, 64, true, 30);
-      meteorRain(0xff, 0xff, 0xff, 10, 64, true, 30, true);
+      meteorRain(10, 64, true, 15, true);
     }
   }
   else{
