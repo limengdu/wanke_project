@@ -1,41 +1,37 @@
+// 导入必要的库
 #include <FastLED.h>
 #include "ESP32_NOW_Serial.h"
 #include "MacAddress.h"
 #include "WiFi.h"
 #include "esp_wifi.h"
 
+
+/********************************* 灯相关 *********************************/
 #define NUM_LEDS 59
 #define LED_PIN_1 D1
 #define LED_PIN_2 D5
-
-// FastLED brightness, 0 (min) to 255 (max)
-#define BRIGHTNESS 255
-
-#define digital_pir_sensor_1 D0
-#define digital_pir_sensor_2 D2
-
+#define BRIGHTNESS 255                    // FastLED brightness, 0 (min) to 255 (max)
 CRGB leds_1[NUM_LEDS];
 CRGB leds_2[NUM_LEDS];
 
-unsigned long lastMotionTime_1 = 0;
-unsigned long lastMotionTime_2 = 0;
+
+/********************************* PIR相关 *********************************/
+#define digital_pir_sensor_1 D0
+#define digital_pir_sensor_2 D2
 const unsigned long motionTimeout = 5000; // 5 seconds
 
-const int motionCountThreshold = 2; // Number of consecutive motion detections to trigger flicker effect
-int motionCount_1 = 0;
-int motionCount_2 = 0;
-bool meteorDirection = true; // true for right to left, false for left to right
+const int motionCountThreshold = 2;       // PIR触发持续有人的阈值
+bool meteorDirection = true;              // 控制流水灯的流转方向
 
-unsigned long lastTriggerTime = 0;
-const unsigned long triggerInterval = 10000; // 10秒内只触发一次效果
-bool effectTriggered = false;
 
-// 0: AP mode, 1: Station mode
-#define ESPNOW_WIFI_MODE_STATION 1
+/********************************* 不倒翁控制相关 *********************************/
+int taskflow = 0;                         // 控制当前任务流
+uint8_t need_num_xiao, need_extra_leds;   // 0号位上报的灯相关信息
 
-// Channel to be used by the ESP-NOW protocol
-#define ESPNOW_WIFI_CHANNEL 1
 
+/********************************* ESP-NOW 相关 *********************************/
+#define ESPNOW_WIFI_MODE_STATION 1    // 0: AP mode, 1: Station mode
+#define ESPNOW_WIFI_CHANNEL 1         // Channel to be used by the ESP-NOW protocol
 #if ESPNOW_WIFI_MODE_STATION          // ESP-NOW using WiFi Station mode
 #define ESPNOW_WIFI_MODE WIFI_STA     // WiFi Mode
 #define ESPNOW_WIFI_IF   WIFI_IF_STA  // WiFi Interface
@@ -45,8 +41,6 @@ bool effectTriggered = false;
 #endif
 
 // Set the MAC address of the device that will receive the data
-// For example: F4:12:FA:40:64:4C
-// 8c:bf:ea:cb:c5:3c
 const MacAddress peer_mac_0({0x8C, 0xBF, 0xEA, 0xCB, 0xC5, 0x3C});
 const MacAddress peer_mac_2({0x8C, 0xBF, 0xEA, 0xCB, 0x80, 0x60});
 const MacAddress peer_mac_6({0x8C, 0xBF, 0xEA, 0xCB, 0x81, 0x70});
@@ -55,6 +49,8 @@ ESP_NOW_Serial_Class NowSerial_0(peer_mac_0, ESPNOW_WIFI_CHANNEL, ESPNOW_WIFI_IF
 ESP_NOW_Serial_Class NowSerial_2(peer_mac_2, ESPNOW_WIFI_CHANNEL, ESPNOW_WIFI_IF);
 ESP_NOW_Serial_Class NowSerial_6(peer_mac_6, ESPNOW_WIFI_CHANNEL, ESPNOW_WIFI_IF);
 
+
+/********************************* 灯效相关函数 *********************************/
 void setAll(CRGB *leds, int numLeds, byte red, byte green, byte blue) {
   for(int i = 0; i < numLeds; i++ ) {
     setPixel(leds, i, red, green, blue);
@@ -70,6 +66,11 @@ void showStrip() {
   FastLED.show();
 }
 
+void fadeToBlack(CRGB *leds, int ledNo, byte fadeValue) {
+  leds[ledNo].fadeToBlackBy(fadeValue);
+}
+
+// PIR 流水灯效
 void meteorRain(CRGB *leds, int numLeds, byte meteorSize, byte meteorTrailDecay, boolean meteorRandomDecay, int SpeedDelay, bool rightToLeft) {  
   setAll(leds, numLeds, 0, 0, 0);
   for(int i = 0; i < numLeds+numLeds; i++) {
@@ -96,22 +97,45 @@ void meteorRain(CRGB *leds, int numLeds, byte meteorSize, byte meteorTrailDecay,
   }
 }
 
-void fadeToBlack(CRGB *leds, int ledNo, byte fadeValue) {
-  leds[ledNo].fadeToBlackBy(fadeValue);
-}
-
-void randomFlicker(CRGB *leds, int numLeds) {
-  for(int i=0; i<numLeds; i++) {
-    if(random(10) < 2) {
-      setPixel(leds, i, 255, 255, 255);
-    } else {
-      setPixel(leds, i, 0, 0, 0);
-    }
+// 作为不倒翁击倒灯效
+void LightUpLeds(CRGB *leds, int numLeds) {
+  for(int i = 0; i < numLeds; i++) {
+    leds[i] = CRGB(sin(i + millis() / 100.0) * 127 + 128, random(0, 255), random(0, 255));
   }
   showStrip();
-  delay(100);
+  delay(500);
 }
 
+
+/********************************* PIR函数 *********************************/
+int motionCount = 0;                    // 用于一直有人时持续触发的灯光效果
+unsigned long lastMotionTime = 0;       // 用于避免同一次PIR反复触发灯光效果
+
+void handlePIR(int pirSensor, CRGB *leds, int numLeds) {
+  bool state = digitalRead(pirSensor); // read from PIR sensor
+  if (state == 1) {
+    Serial.print("A Motion has occured on sensor ");
+    Serial.println(pirSensor == digital_pir_sensor_1 ? "1" : "2");  // When there is a response
+    motionCount++;
+    if (motionCount >= motionCountThreshold) {
+      meteorRain(leds, numLeds, 10, 64, true, 30, meteorDirection);
+      meteorDirection = !meteorDirection;
+    } else {
+        meteorDirection = true;
+        meteorRain(leds, numLeds, 10, 64, true, 30, meteorDirection);
+      }
+    
+    lastMotionTime = millis();
+  }
+  else if (millis() - lastMotionTime > motionTimeout) {
+    Serial.print("Nothing Happened on sensor ");
+    Serial.println(pirSensor == digital_pir_sensor_1 ? "1" : "2");  // Far from PIR sensor
+    motionCount = 0;
+    // setAll(leds, numLeds, 0, 0, 0); // Turn off all LEDs when no motion is detected
+  }
+}
+
+/********************************* Arduino *********************************/
 void setup()
 {
   Serial.begin(115200);  // set baud rate as 9600
@@ -146,84 +170,81 @@ void setup()
   Serial.println("You can now send data to the peer device using the Serial Monitor.\n");
 }
 
+
 void loop()
 {
-  if (NowSerial_0.available()) {
-    int receivedData = NowSerial_0.read();
-    Serial.print("Received data from device 0: ");
-    Serial.println(receivedData);
+  // IMU XIAO 的消息到达（优先级最高）
+  if (NowSerial_0.available() >= 0) {
+    int bytesRead = NowSerial_0.readBytes(&need_num_xiao, 1);
+    bytesRead += NowSerial_0.readBytes(&need_extra_leds, 1);
+    if (bytesRead == 2) {
+      Serial.print("Received array from device 0: ");
 
-    if (receivedData == 1) {
-      unsigned long currentTime = millis();
-      if (!effectTriggered || (currentTime - lastTriggerTime >= triggerInterval)) {
-        // 如果效果尚未触发或者距离上次触发已经超过了触发间隔,则触发效果
-        meteorRain(leds_1, NUM_LEDS, 10, 64, true, 30, meteorDirection);
-        meteorRain(leds_2, NUM_LEDS, 10, 64, true, 30, meteorDirection);
-        // meteorDirection = !meteorDirection;
-        effectTriggered = true;
-        lastTriggerTime = currentTime;
-
-        // 发送 ESP-NOW 消息给下一个设备
-        if (NowSerial_2.availableForWrite()) {
-            if (NowSerial_2.write(receivedData) <= 0) {
-              Serial.println("Failed to send data to device 2");
-            } else {
-              Serial.println("Send data to device 2 Successfully");
-            }
-          }
-        if (NowSerial_6.availableForWrite()) {
-          if (NowSerial_6.write(receivedData) <= 0) {
-            Serial.println("Failed to send data to device 6");
-          } else {
-            Serial.println("Send data to device 6 Successfully");
-          }
-        }
-      }
+      // 获得灯条相关的信息
+      Serial.print("Need Num of XIAO: "); Serial.println(need_num_xiao);
+      Serial.print("Need Num of extra LEDS: "); Serial.println(need_extra_leds);
+      taskflow = 2;
     }
   }
-  // else {
-    // bool state_1 = digitalRead(digital_pir_sensor_1); // read from PIR sensor 1
-    // if (state_1 == 1){
-    //   Serial.println("A Motion has occured on sensor 1");  // When there is a response
-    //   motionCount_1++;
-    //   if(motionCount_1 >= motionCountThreshold) {
-    //     meteorRain(leds_1, NUM_LEDS, 10, 64, true, 30, meteorDirection);
-    //     meteorDirection = !meteorDirection;
-    //   } else {
-    //     meteorRain(leds_1, NUM_LEDS, 10, 64, true, 30, true);
-    //   }
-    //   lastMotionTime_1 = millis();
-    // }
-    // else if (millis() - lastMotionTime_1 > motionTimeout) {
-    //   Serial.println("Nothing Happened on sensor 1");  // Far from PIR sensor 1
-    //   motionCount_1 = 0;
-    //   setAll(leds_1, NUM_LEDS_1, 0, 0, 0); // Turn off all LEDs when no motion is detected
-    // }
 
-    // bool state_2 = digitalRead(digital_pir_sensor_2); // read from PIR sensor 2
-    // if (state_2 == 1){
-    //   Serial.println("A Motion has occured on sensor 2");  // When there is a response
-    //   motionCount_2++;
-    //   if(motionCount_2 >= motionCountThreshold) {
-    //     meteorRain(leds_2, NUM_LEDS_2, 10, 64, true, 30, meteorDirection);
-    //     meteorDirection = !meteorDirection;
-    //   } else {
-    //     meteorRain(leds_2, NUM_LEDS_2, 10, 64, true, 30, true);
-    //   }
-    //   lastMotionTime_2 = millis();
-    // }
-    // else if (millis() - lastMotionTime_2 > motionTimeout) {
-    //   Serial.println("Nothing Happened on sensor 2");  // Far from PIR sensor 2
-    //   motionCount_2 = 0;
-    //   setAll(leds_2, NUM_LEDS_2, 0, 0, 0); // Turn off all LEDs when no motion is detected
-    // }
-  // }
-  else{
-    Serial.println("Nothing Happened");  // Far from PIR sensor
-    motionCount_1 = 0;
-    motionCount_2 = 0;
-    setAll(leds_1, NUM_LEDS, 0, 0, 0); // Turn off all LEDs when no motion is detected
-    setAll(leds_2, NUM_LEDS, 0, 0, 0);
-    delay(100);
+  // 不倒翁效果结束的消息传来
+  int receivedData_2, receivedData_6 = 0;
+  if (NowSerial_2.available()) {
+    receivedData_2 = NowSerial_2.read();
+    Serial.print("Received data from XIAO 2: ");
+    Serial.println(receivedData_2);
   }
+  if (NowSerial_6.available()) {
+    receivedData_6 = NowSerial_6.read();
+    Serial.print("Received data from XIAO 6: ");
+    Serial.println(receivedData_6);
+  }
+  // 重新开启 PIR
+  if (receivedData_2 && receivedData_6) {
+    taskflow = 1;
+  }
+
+  switch(taskflow) {
+    case 1:                    // PIR工作流
+      handlePIR(digital_pir_sensor_1, leds_1, NUM_LEDS);
+      handlePIR(digital_pir_sensor_2, leds_2, NUM_LEDS);
+      break;
+    case 2:                    // 不倒翁工作流
+      need_num_xiao -= 1;
+      if (need_num_xiao) {
+        // 先发送 ESP-NOW 消息给下一个设备
+        if (NowSerial_2.availableForWrite()) {
+          int bytesWritten = NowSerial_2.write(need_num_xiao);
+          bytesWritten += NowSerial_2.write(need_extra_leds);
+          if (bytesWritten == 2) {
+            Serial.println("Send data to XIAO 2 Successfully");
+          } else {
+            Serial.println("Failed to send data to XIAO 2");
+          }
+        }
+      
+        if (NowSerial_6.availableForWrite()) {
+          int bytesWritten = NowSerial_6.write(need_num_xiao);
+          bytesWritten += NowSerial_6.write(need_extra_leds);
+          if (bytesWritten == 2) {
+            Serial.println("Send data to XIAO 6 Successfully");
+          } else {
+            Serial.println("Failed to send data to XIAO 6");
+          }
+        }
+
+        // 再同时点亮两个灯条
+        LightUpLeds(leds_1, NUM_LEDS);
+        LightUpLeds(leds_2, NUM_LEDS);
+      }
+
+      // 再同时点亮两个灯条
+      LightUpLeds(leds_1, need_extra_leds);
+      LightUpLeds(leds_2, need_extra_leds);
+      break;
+    defalut:
+      Serial.println("Nothing Happened");  // Far from PIR sensor
+  }
+
+  taskflow = 0;
 }
