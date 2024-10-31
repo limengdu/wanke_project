@@ -8,16 +8,13 @@
 
 /********************************* 灯相关 *********************************/
 #define NUM_LEDS 59
-#define LED_PIN_1 D1
-#define LED_PIN_2 D5
+#define LED_PIN D1
 #define BRIGHTNESS 255                    // FastLED brightness, 0 (min) to 255 (max)
-CRGB leds_1[NUM_LEDS];
-CRGB leds_2[NUM_LEDS];
+CRGB leds[NUM_LEDS];
 
 
 /********************************* PIR相关 *********************************/
-#define digital_pir_sensor_1 D0
-#define digital_pir_sensor_2 D2
+#define digital_pir_sensor D0
 const unsigned long motionTimeout = 5000; // 5 seconds
 
 const int motionCountThreshold = 2;       // PIR触发持续有人的阈值
@@ -27,7 +24,8 @@ bool meteorDirection = true;              // 控制流水灯的流转方向
 /********************************* 不倒翁控制相关 *********************************/
 int taskflow = 0;                         // 控制当前任务流
 uint8_t need_num_xiao, need_extra_leds;   // 0号位上报的灯相关信息
-
+bool tumbler_done = false;                // 标记不倒翁效果是否完成
+bool tumbler_executed = false;            // 标记不倒翁效果是否已经执行过
 
 /********************************* ESP-NOW 相关 *********************************/
 #define ESPNOW_WIFI_MODE_STATION 1    // 0: AP mode, 1: Station mode
@@ -99,11 +97,44 @@ void meteorRain(CRGB *leds, int numLeds, byte meteorSize, byte meteorTrailDecay,
 
 // 作为不倒翁击倒灯效
 void LightUpLeds(CRGB *leds, int numLeds) {
-  for(int i = 0; i < numLeds; i++) {
+  for (int i = 0; i < numLeds; i++) {
     leds[i] = CRGB(sin(i + millis() / 100.0) * 127 + 128, random(0, 255), random(0, 255));
+  }
+  // 确保 numLeds 之后的灯珠全部熄灭
+  for (int i = numLeds; i < NUM_LEDS; i++) {
+    leds[i] = CRGB::Black;
   }
   showStrip();
   delay(500);
+}
+
+// 逐颗熄灭LED
+void fadeOutLeds(CRGB *leds, int numLeds) {
+  for (int i = numLeds - 1; i >= 0; i--) {
+    leds[i] = CRGB::Black;
+    showStrip();
+    delay(500);
+  }
+}
+
+// 不倒翁持续一会的灯效
+// void RunningLights(byte red, byte green, byte blue, int numLeds) {
+void RunningLights(int numLeds) {
+  int Position=0;
+  for(int j = 0; j < numLeds * 2; j++)
+  {
+    Position++; // = 0; //Position + Rate;
+    for(int i=0; i < numLeds; i++) {
+      // sine wave, 3 offset waves make a rainbow!
+      float level = sin(i+Position) * 127 + 128;
+      setPixel(leds, i,level,0,0);
+      // setPixel(i,((sin(i+Position) * 127 + 128)/255)*red,
+      //             ((sin(i+Position) * 127 + 128)/255)*green,
+      //             ((sin(i+Position) * 127 + 128)/255)*blue);
+    }
+    showStrip();
+    delay(500);
+  }
 }
 
 
@@ -114,8 +145,7 @@ unsigned long lastMotionTime = 0;       // 用于避免同一次PIR反复触发�
 void handlePIR(int pirSensor, CRGB *leds, int numLeds) {
   bool state = digitalRead(pirSensor); // read from PIR sensor
   if (state == 1) {
-    Serial.print("A Motion has occured on sensor ");
-    Serial.println(pirSensor == digital_pir_sensor_1 ? "1" : "2");  // When there is a response
+    Serial.println("A Motion has occured on PIR sensor.");
     motionCount++;
     if (motionCount >= motionCountThreshold) {
       meteorRain(leds, numLeds, 10, 64, true, 30, meteorDirection);
@@ -128,23 +158,21 @@ void handlePIR(int pirSensor, CRGB *leds, int numLeds) {
     lastMotionTime = millis();
   }
   else if (millis() - lastMotionTime > motionTimeout) {
-    Serial.print("Nothing Happened on sensor ");
-    Serial.println(pirSensor == digital_pir_sensor_1 ? "1" : "2");  // Far from PIR sensor
+    Serial.println("Nothing Happened on PIR sensor.");
     motionCount = 0;
     // setAll(leds, numLeds, 0, 0, 0); // Turn off all LEDs when no motion is detected
   }
 }
 
+
 /********************************* Arduino *********************************/
 void setup()
 {
-  Serial.begin(115200);  // set baud rate as 9600
+  Serial.begin(115200);               // set baud rate as 115200
 
-  pinMode(digital_pir_sensor_1, INPUT); // set Pin mode as input
-  pinMode(digital_pir_sensor_2, INPUT); // set Pin mode as input
+  pinMode(digital_pir_sensor, INPUT); // set Pin mode as input
 
-  FastLED.addLeds<WS2812B, LED_PIN_1, GRB>(leds_1, NUM_LEDS);
-  FastLED.addLeds<WS2812B, LED_PIN_2, GRB>(leds_2, NUM_LEDS);
+  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(BRIGHTNESS);
 
   Serial.print("WiFi Mode: ");
@@ -167,28 +195,37 @@ void setup()
   NowSerial_0.begin(115200);
   NowSerial_2.begin(115200);
   NowSerial_6.begin(115200);
-  Serial.println("You can now send data to the peer device using the Serial Monitor.\n");
+  Serial.println("XIAO NUM 1 Ready.\n");
 }
 
 
 void loop()
 {
   // IMU XIAO 的消息到达（优先级最高）
-  if (NowSerial_0.available() >= 0) {
+  if (NowSerial_0.available() >= 0 && !tumbler_executed) {
     int bytesRead = NowSerial_0.readBytes(&need_num_xiao, 1);
     bytesRead += NowSerial_0.readBytes(&need_extra_leds, 1);
     if (bytesRead == 2) {
-      Serial.print("Received array from device 0: ");
-
+      Serial.print("Received array from XIAO 0: ");
       // 获得灯条相关的信息
       Serial.print("Need Num of XIAO: "); Serial.println(need_num_xiao);
       Serial.print("Need Num of extra LEDS: "); Serial.println(need_extra_leds);
-      taskflow = 2;
+      // 给上一个XIAO发确认帧
+      if (NowSerial_0.availableForWrite()) {
+        int bytesWritten_0 = NowSerial_0.write(8);
+        if (bytesWritten_0) {
+              Serial.println("Send data to XIAO 0 Successfully");
+              taskflow = 2; // 切换到不倒翁工作流
+              tumbler_done = false; // 标记不倒翁效果尚未完成
+            } else {
+              Serial.println("Failed to send data to XIAO 0");
+            }
+      }
     }
   }
 
   // 不倒翁效果结束的消息传来
-  int receivedData_2, receivedData_6 = 0;
+  int receivedData_2, receivedData_6 = 1;
   if (NowSerial_2.available()) {
     receivedData_2 = NowSerial_2.read();
     Serial.print("Received data from XIAO 2: ");
@@ -199,52 +236,84 @@ void loop()
     Serial.print("Received data from XIAO 6: ");
     Serial.println(receivedData_6);
   }
-  // 重新开启 PIR
-  if (receivedData_2 && receivedData_6) {
-    taskflow = 1;
+  // 如果收到来自 XIAO 2 和 XIAO 6 的消息,说明不倒翁效果已完成
+  if (receivedData_2  == 0 && receivedData_6  == 0) {
+    tumbler_done = true; // 标记不倒翁效果已完成
+    // 发送消息给XIAO 0,通知不倒翁效果已完成
+    if (NowSerial_0.availableForWrite()) {
+      NowSerial_0.write(0);
+      Serial.println("Sent tumbler done message to XIAO 0");
+    }
+    fadeOutLeds(leds, NUM_LEDS);
   }
 
   switch(taskflow) {
     case 1:                    // PIR工作流
-      handlePIR(digital_pir_sensor_1, leds_1, NUM_LEDS);
-      handlePIR(digital_pir_sensor_2, leds_2, NUM_LEDS);
+      handlePIR(digital_pir_sensor, leds, NUM_LEDS);
       break;
     case 2:                    // 不倒翁工作流
-      need_num_xiao -= 1;
-      if (need_num_xiao) {
-        // 先发送 ESP-NOW 消息给下一个设备
-        if (NowSerial_2.availableForWrite()) {
-          int bytesWritten = NowSerial_2.write(need_num_xiao);
-          bytesWritten += NowSerial_2.write(need_extra_leds);
-          if (bytesWritten == 2) {
-            Serial.println("Send data to XIAO 2 Successfully");
-          } else {
-            Serial.println("Failed to send data to XIAO 2");
+      if (!tumbler_executed) { // 如果不倒翁效果尚未执行过
+        need_num_xiao -= 1;
+        if (need_num_xiao > 0) {
+          // 先发送 ESP-NOW 消息给下一个设备
+          // 同时发送 ESP-NOW 消息给下一个设备
+          if (NowSerial_2.availableForWrite()) {
+            int bytesWritten_2 = NowSerial_2.write(need_num_xiao);
+            bytesWritten_2 += NowSerial_2.write(need_extra_leds);
+            if (bytesWritten_2 == 2) {
+              Serial.println("Send data to XIAO 2 Successfully");
+            } else {
+              Serial.println("Failed to send data to XIAO 2");
+            }
           }
-        }
-      
-        if (NowSerial_6.availableForWrite()) {
-          int bytesWritten = NowSerial_6.write(need_num_xiao);
-          bytesWritten += NowSerial_6.write(need_extra_leds);
-          if (bytesWritten == 2) {
-            Serial.println("Send data to XIAO 6 Successfully");
-          } else {
-            Serial.println("Failed to send data to XIAO 6");
+          if (NowSerial_6.availableForWrite()) {
+            int bytesWritten_6 = NowSerial_6.write(need_num_xiao);
+            bytesWritten_6 += NowSerial_6.write(need_extra_leds);
+            if (bytesWritten_6 == 2) {
+              Serial.println("Send data to XIAO 6 Successfully");
+            } else {
+              Serial.println("Failed to send data to XIAO 6");
+            }
           }
+            // 再同时点亮两个灯条
+            LightUpLeds(leds, NUM_LEDS);
+            // delay(1000);
+            // RunningLightsSimultaneously(leds_1, leds_2, NUM_LEDS);
+        } else {
+          // 如果不用点亮下个灯珠,发送0给下两个设备
+          if (NowSerial_2.availableForWrite()) {
+            int bytesWritten_2 = NowSerial_2.write(0);
+            bytesWritten_2 += NowSerial_2.write(0);
+            if (bytesWritten_2 == 2) {
+              Serial.println("Send 0 to XIAO 2 Successfully");
+            } else {
+              Serial.println("Failed to send 0 to XIAO 2");
+            }
+          }
+          if (NowSerial_6.availableForWrite()) {
+            int bytesWritten_6 = NowSerial_6.write(0);
+            bytesWritten_6 += NowSerial_6.write(0);
+            if (bytesWritten_6 == 2) {
+              Serial.println("Send 0 to XIAO 6 Successfully");
+            } else {
+              Serial.println("Failed to send 0 to XIAO 6");
+            }
+          }
+          // 只亮本灯条的两个灯条对应的灯珠数量
+          LightUpLeds(leds, need_extra_leds);
+          // delay(1000);
+          // RunningLightsSimultaneously(leds_1, leds_2, need_extra_leds);
         }
-
-        // 再同时点亮两个灯条
-        LightUpLeds(leds_1, NUM_LEDS);
-        LightUpLeds(leds_2, NUM_LEDS);
+        tumbler_executed = true; // 标记不倒翁效果已经执行过
       }
-
-      // 再同时点亮两个灯条
-      LightUpLeds(leds_1, need_extra_leds);
-      LightUpLeds(leds_2, need_extra_leds);
+      // 如果不倒翁效果已完成,切换回PIR工作流
+      if (tumbler_done) {
+        taskflow = 1;
+        tumbler_executed = false; // 重置不倒翁效果执行标记
+      }
       break;
-    defalut:
-      Serial.println("Nothing Happened");  // Far from PIR sensor
+    default:
+      taskflow = 1; // 如果没有任何任务,切换到PIR工作流
+      Serial.println("Nothing Happened, switch to PIR workflow");  // Far from PIR sensor
   }
-
-  taskflow = 0;
 }
