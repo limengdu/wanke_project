@@ -1,7 +1,3 @@
-#include <esp_now.h>
-#include <WiFi.h>
-#include <cstring>
-
 // =========================
 // 配置部分
 // 发送阶段：
@@ -14,8 +10,23 @@
 // =========================
 
 // 设备编号（0 到 10）
-#define DEVICE_ID 5  // 修改为对应设备的编号（0到10）
+#define DEVICE_ID 0  // 修改为对应设备的编号（0到10）
 
+// 导入必要的库
+#include <esp_now.h>
+#include <WiFi.h>
+#include <cstring>
+#include <cmath>
+
+#if DEVICE_ID == 0
+#include "LIS3DHTR.h"
+#include <Wire.h>
+LIS3DHTR<TwoWire> LIS; //IIC
+#define WIRE Wire
+#endif
+
+
+/********************************* ESP-NOW 相关 *********************************/
 // 定义MAC地址数组
 uint8_t device_macs[11][6] = {
   {0x8C, 0xBF, 0xEA, 0xCB, 0xC5, 0x3C}, // 0
@@ -89,7 +100,6 @@ const int prev_devices[11][1] = {
     {9}   //10
 };
 
-
 // 定义回复计数器（仅0号设备需要）
 #if DEVICE_ID == 0
 volatile int reply_count = 0;
@@ -97,18 +107,30 @@ volatile int reply_count = 0;
 
 bool ready_to_send = (DEVICE_ID == 0) ? true : false; // 0号设备准备发送
 
-// =========================
 // 消息结构定义
-// =========================
 typedef struct struct_message {
   uint8_t type;         // 0x01: 发送, 0x02: 回传, 0x03: PIR
   uint8_t num_xiao;     // 需要的XIAO数量（仅type=0x01时有效）
   uint16_t num_leds;    // 灯珠数量（仅type=0x01时有效）
 } struct_message;
 
-// =========================
+
+/********************************* 不倒翁相关 FOR XIAO 0 *********************************/
+#if DEVICE_ID == 0
+const int MAX_LEDS = 59 * 5;       // 总共59*5个灯珠
+const int PER_LEDS = 59;           // 单灯条59个灯珠
+const float FORCE_THRESHOLD = 2.1; // 力度阈值,可根据实际情况调整
+const float MAX_THRESHOLD = 3.54;  // 最大力度,可根据实际情况调整
+unsigned long hitStartTime = 0;    // 记录击打开始的时间
+float magnitudeSum = 0;            // 存储击打期间所有幅度值的总和
+int magnitudeCount = 0;            // 记录击打期间的幅度值数量
+#endif
+
+
+
+
+/********************************* ESP-NOW 相关函数 *********************************/
 // ESP-NOW消息发送函数
-// =========================
 void sendMessage(uint8_t *peer_addr, struct_message msg) {
   esp_err_t result = esp_now_send(peer_addr, (uint8_t *) &msg, sizeof(msg));
   if (result == ESP_OK) {
@@ -119,9 +141,7 @@ void sendMessage(uint8_t *peer_addr, struct_message msg) {
   }
 }
 
-// =========================
 // 接收回调函数
-// =========================
 void onDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
   if (len != sizeof(struct_message)) {
     Serial.println("接收到的消息长度不正确");
@@ -130,7 +150,6 @@ void onDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incoming
 
   struct_message msg;
   memcpy(&msg, incomingData, sizeof(msg));
-
   // 获取发送者ID
   int sender_id = -1;
   for(int i = 0; i < 11; i++) {
@@ -139,58 +158,76 @@ void onDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incoming
       break;
     }
   }
-
   if(sender_id == -1){
     Serial.println("未知发送者");
     return;
   }
-
   Serial.printf("接收到来自设备%d的消息: Type=0x%02X, NumESP=%d, NumLEDs=%d\n", sender_id, msg.type, msg.num_xiao, msg.num_leds);
 
   // 处理消息
-  if(msg.type == 0x01){ // 发送消息
-    // 如果有下一个设备，转发消息
-    for(int i = 0; i < num_next_devices[DEVICE_ID]; i++){
-      int child_id = next_devices[DEVICE_ID][i];
-      if(child_id != -1){
-        sendMessage(device_macs[child_id], msg);
-        Serial.printf("设备%d转发消息给设备%d\n", DEVICE_ID, child_id);
+  switch(msg.type) {
+    case 0x01:  // 发送消息
+      // 如果有下一个设备，转发消息
+      for(int i = 0; i < num_next_devices[DEVICE_ID]; i++){
+        int child_id = next_devices[DEVICE_ID][i];
+        if(child_id != -1){
+          sendMessage(device_macs[child_id], msg);
+          Serial.printf("设备%d转发消息给设备%d\n", DEVICE_ID, child_id);
+        }
       }
-    }
-    // 如果没有下一个设备（即最终设备），开始回传
-    if(num_next_devices[DEVICE_ID] == 0){
-        struct_message reply;
-        reply.type = 0x02; // 回传消息
-        reply.num_xiao = 0;
-        reply.num_leds = 0;
-        // 发送回上一个设备
-        sendMessage(device_macs[prev_devices[DEVICE_ID][0]], reply);
-        Serial.printf("设备%d发送回传消息给设备%d\n", DEVICE_ID, prev_devices[DEVICE_ID][0]);
-    }
-  }
-
-  else if(msg.type == 0x02){ // 回传消息
-    // 如果有上一个设备，回传消息
-    if(prev_devices[DEVICE_ID][0] != -1){
-      sendMessage(device_macs[prev_devices[DEVICE_ID][0]], msg);
-      Serial.printf("设备%d回传消息给设备%d\n", DEVICE_ID, prev_devices[DEVICE_ID][0]);
-    }
-    else{
-      // 如果是0号设备，标记收到回传消息
-      #if DEVICE_ID == 0
-      reply_count++;
-      Serial.printf("0号设备收到第%d个回传回复\n", reply_count);
-      // if(reply_count >= 2){ // 0号设备同时接收来自1和6的回传
-      if(reply_count >= 1){
-        ready_to_send = true;
-        reply_count = 0;
-        Serial.println("0号设备已收到所有回传回复，准备发送下一次消息");
+      // 如果没有下一个设备（即最终设备），开始回传
+      if(num_next_devices[DEVICE_ID] == 0){
+          struct_message reply;
+          reply.type = 0x02; // 回传消息
+          reply.num_xiao = 0;
+          reply.num_leds = 0;
+          // 发送回上一个设备
+          sendMessage(device_macs[prev_devices[DEVICE_ID][0]], reply);
+          Serial.printf("设备%d发送回传消息给设备%d\n", DEVICE_ID, prev_devices[DEVICE_ID][0]);
       }
-      #endif
-    }
+      break;
+    case 0x02:  // 回传消息
+      // 如果有上一个设备，回传消息
+      if(prev_devices[DEVICE_ID][0] != -1){
+        sendMessage(device_macs[prev_devices[DEVICE_ID][0]], msg);
+        Serial.printf("设备%d回传消息给设备%d\n", DEVICE_ID, prev_devices[DEVICE_ID][0]);
+      }
+      else{
+        // 如果是0号设备，标记收到回传消息
+        #if DEVICE_ID == 0
+        reply_count++;
+        Serial.printf("0号设备收到第%d个回传回复\n", reply_count);
+        // if(reply_count >= 2){ // 0号设备同时接收来自1和6的回传
+        if(reply_count >= 1){
+          ready_to_send = true;
+          reply_count = 0;
+          Serial.println("0号设备已收到所有回传回复，准备发送下一次消息");
+        }
+        #endif
+      }
+      break;
+    default:
+      Serial.println("未知的消息类型");
+      break;
   }
 }
 
+
+/********************************* 灯相关函数 *********************************/
+// 计算需要点亮的LED数量
+int calculateNumLedsToLight(float avgMagnitude) {
+  if (avgMagnitude >= MAX_THRESHOLD) {
+    return MAX_LEDS;
+  } else if (avgMagnitude <= FORCE_THRESHOLD) {
+    return 1;  // 如果平均幅度小于或等于最小阈值,点亮1个LED
+  } else {
+    float ratio = (avgMagnitude - FORCE_THRESHOLD) / (MAX_THRESHOLD - FORCE_THRESHOLD);
+    return round(ratio * (MAX_LEDS - 1)) + 2;  // 使用round函数四舍五入,并确保至少点亮1个LED
+  }
+}
+
+
+/********************************* Arduino *********************************/
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -250,33 +287,72 @@ void setup() {
   }
 
   // 0号设备准备发送
-  if(DEVICE_ID == 0){
-    ready_to_send = true;
-  }
+#if DEVICE_ID == 0
+  LIS.begin(WIRE,0x19); //IIC init
+  LIS.openTemp();  //If ADC3 is used, the temperature detection needs to be turned off.
+  delay(100);
+  LIS.setFullScaleRange(LIS3DHTR_RANGE_2G);
+  LIS.setOutputDataRate(LIS3DHTR_DATARATE_50HZ);
+  ready_to_send = true;
+#endif
 
   Serial.print("XIAO "); Serial.print(DEVICE_ID); Serial.print(" "); Serial.println("Ready!");
 }
 
 void loop() {
   // 0号设备负责发送消息
-  #if DEVICE_ID == 0
-  if(ready_to_send){
-    struct_message msg;
-    msg.type = 0x01; // 发送类型
-    msg.num_xiao = 11; // 总ESP32数量
-    msg.num_leds = 60; // 灯珠数量（示例）
-
-    Serial.println("0号设备发送消息");
-    // 同时发送给1号和6号设备
-    for(int i=0; i<num_next_devices[DEVICE_ID]; i++){
-      int child_id = next_devices[DEVICE_ID][i];
-      if(child_id != -1){
-        sendMessage(device_macs[child_id], msg);
-      }
-    }
-    ready_to_send = false;
+#if DEVICE_ID == 0
+  if (!LIS){
+    Serial.println("LIS3DHTR didn't connect.");
+    return;
   }
-  #endif
+  if(ready_to_send){
+    float x = LIS.getAccelerationX();               // 获得三轴的值
+    float y = LIS.getAccelerationY(); 
+    float z = LIS.getAccelerationZ();
+    float magnitude = sqrt(x * x + y * y + z * z);  // 计算三轴加速度的模长
+    if (magnitude > FORCE_THRESHOLD) {              // 一旦模长大于击中的阈值
+      hitStartTime = millis();                      // 如果这是一次新的击打,记录击打开始时间
+      float maxMagnitude = magnitude;               // 初始化最大模长为当前模长
+      while (millis() - hitStartTime < 2000) {      // 在击打开始的两秒内,累加幅度值,并增加计数器
+        x = LIS.getAccelerationX();                 // 获得三轴的值
+        y = LIS.getAccelerationY(); 
+        z = LIS.getAccelerationZ();
+        magnitude = sqrt(x * x + y * y + z * z);    // 计算三轴加速度的模长
+        maxMagnitude = max(magnitude, maxMagnitude);  // 更新最大模长
+      }
+      // float avgMagnitude = magnitudeSum / magnitudeCount;  // 平均模长
+      // int numLedsToLight = calculateNumLedsToLight(avgMagnitude);
+      
+      int numLedsToLight = calculateNumLedsToLight(maxMagnitude);
+      Serial.println("Hit the tumbler.");
+      Serial.print("MAX magnitude: "); Serial.println(maxMagnitude);
+      Serial.print("Need Total LEDs Number: "); Serial.println(numLedsToLight);
+      // Serial.print("Average magnitude: "); Serial.println(avgMagnitude);
+
+      struct_message msg;
+      msg.type = 0x01;                                        // 发送类型
+      msg.num_xiao = ceil(numLedsToLight / (float)PER_LEDS);  // 总需要XIAO的数量  // 总需要XIAO的数量
+      msg.num_leds = numLedsToLight % PER_LEDS;               // 灯珠数量
+      Serial.print("Need Total XIAO Number: "); Serial.println(msg.num_xiao);
+      Serial.print("Need Extra LEDs Number: "); Serial.println(msg.num_leds);
+
+      // msg.type = 0x01;   // 发送类型
+      // msg.num_xiao = 5;  // 总需要XIAO的数量
+      // msg.num_leds = 30; // 灯珠数量
+
+      Serial.println("0号设备发送消息");
+      // 同时发送给1号和6号设备
+      for(int i = 0; i < num_next_devices[DEVICE_ID]; i++){
+        int child_id = next_devices[DEVICE_ID][i];
+        if(child_id != -1){
+          sendMessage(device_macs[child_id], msg);
+        }
+      }
+      ready_to_send = false;
+    }
+  }
+#endif
 
   // 可以添加其他逻辑，如用户输入触发发送等
 
