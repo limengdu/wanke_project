@@ -10,7 +10,7 @@
 // =========================
 
 // 设备编号（0 到 10）
-#define DEVICE_ID 0  // 修改为对应设备的编号（0到10）
+#define DEVICE_ID 1  // 修改为对应设备的编号（0到10）
 
 // 导入必要的库
 #include <esp_now.h>
@@ -142,46 +142,6 @@ int magnitudeCount = 0;            // 记录击打期间的幅度值数量
 
 
 /********************************* ESP-NOW 相关函数 *********************************/
-// 超时时间和最大重发次数
-const int MAX_RETRIES = 100;            // 最大重试次数
-const unsigned long ACK_TIMEOUT = 1000;  // 等待ACK的超时时间，单位：毫秒
-bool ack_received = false;
-// ESP-NOW消息发送函数
-bool sendMessageWithAck(uint8_t *peer_addr, struct_message msg) {
-  int retry_count = 0;
-  ack_received = false;
-  while (retry_count < MAX_RETRIES && !ack_received) {
-    esp_err_t result = esp_now_send(peer_addr, (uint8_t *) &msg, sizeof(msg));
-    if (result == ESP_OK) {
-      Serial.println("消息发送成功，等待ACK...");
-      
-      unsigned long start_time = millis();
-      while (millis() - start_time < ACK_TIMEOUT) {
-        // 检查是否收到ACK
-        if (ack_received) {
-          Serial.println("收到ACK确认消息");
-          return true;
-        }
-        delay(10);  // 稍微等待一下
-      }
-      
-      // 如果超时还没有收到ACK
-      Serial.println("未收到ACK，重试发送...");
-      retry_count++;
-    } else {
-      Serial.println("消息发送失败");
-      return false;
-    }
-  }
-  // 如果超过最大重试次数
-  if (!ack_received) {
-    Serial.println("发送失败，超过最大重试次数");
-    return false;
-  }
-  
-  return true;
-}
-
 // ESP-NOW消息发送函数
 void sendMessage(uint8_t *peer_addr, struct_message msg) {
   esp_err_t result = esp_now_send(peer_addr, (uint8_t *) &msg, sizeof(msg));
@@ -191,11 +151,6 @@ void sendMessage(uint8_t *peer_addr, struct_message msg) {
   else {
     Serial.println("消息发送失败");
   }
-}
-
-// 处理ACK的函数，接收到ACK时将其标记为收到
-void onAckReceived() {
-  ack_received = true;
 }
 
 // 接收回调函数
@@ -219,24 +174,7 @@ void onDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incoming
     Serial.println("未知发送者");
     return;
   }
-
-  // 处理接收到的消息
-  if (msg.type == 0x01) {
-    Serial.printf("接收到来自设备%d的消息: NumXiao=%d, NumLEDs=%d\n", sender_id, msg.num_xiao, msg.num_leds);
-    // 发送ACK确认消息
-    struct_message ack_msg;
-    ack_msg.type = 0x03;  // 确认消息
-    sendMessage(device_macs[sender_id], ack_msg);
-    Serial.printf("设备%d发送ACK消息确认接收\n", DEVICE_ID);
-  }
-  else if (msg.type == 0x02) {
-    Serial.printf("接收到来自设备%d的消息: NumXiao=%d, NumLEDs=%d\n", sender_id, msg.num_xiao, msg.num_leds);
-    // 发送ACK确认消息
-    struct_message ack_msg;
-    ack_msg.type = 0x03;  // 确认消息
-    sendMessage(device_macs[sender_id], ack_msg);
-    Serial.printf("设备%d发送ACK消息确认接收\n", DEVICE_ID);
-  }
+  Serial.printf("接收到来自设备%d的消息: Type=0x%02X, NumESP=%d, NumLEDs=%d\n", sender_id, msg.type, msg.num_xiao, msg.num_leds);
 
   // 处理消息
   switch(msg.type) {
@@ -254,7 +192,7 @@ void onDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incoming
         for (int i = 0; i < num_next_devices[DEVICE_ID]; i++) {
           int child_id = next_devices[DEVICE_ID][i];
           if (child_id != -1) {
-            sendMessageWithAck(device_macs[child_id], msg);
+            sendMessage(device_macs[child_id], msg);
             Serial.printf("设备%d转发消息给设备%d\n", DEVICE_ID, child_id);
           }
         }
@@ -269,7 +207,7 @@ void onDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incoming
         for (int i = 0; i < num_next_devices[DEVICE_ID]; i++) {
           int child_id = next_devices[DEVICE_ID][i];
           if (child_id != -1) {
-            sendMessageWithAck(device_macs[child_id], msg);
+            sendMessage(device_macs[child_id], msg);
             Serial.printf("设备%d转发消息给设备%d\n", DEVICE_ID, child_id);
           }
         }
@@ -289,7 +227,7 @@ void onDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incoming
         for (int i = 0; i < num_prev_devices[DEVICE_ID]; i++) {
           int parent_id = prev_devices[DEVICE_ID][i];
           if (parent_id != -1) {
-            sendMessageWithAck(device_macs[parent_id], reply);
+            sendMessage(device_macs[parent_id], reply);
             Serial.printf("设备%d回传消息给设备%d\n", DEVICE_ID, parent_id);
           }
         }
@@ -301,7 +239,7 @@ void onDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incoming
     case 0x02:  // 回传消息
       // 如果有上一个设备，回传消息
       if(prev_devices[DEVICE_ID][0] != -1){
-        sendMessageWithAck(device_macs[prev_devices[DEVICE_ID][0]], msg);
+        sendMessage(device_macs[prev_devices[DEVICE_ID][0]], msg);
         Serial.printf("设备%d回传消息给设备%d\n", DEVICE_ID, prev_devices[DEVICE_ID][0]);
         // 执行逐个熄灯效果
         fadeOutReverse(leds, PER_LEDS, 10);
@@ -320,11 +258,6 @@ void onDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incoming
 #endif
       }
       pir_enabled = true;  // 不倒翁灯效执行完毕，重新启用PIR
-      break;
-    case 0x03:
-      // 如果接收到的是ACK消息
-      Serial.printf("设备%d接收到ACK消息\n", DEVICE_ID);
-      onAckReceived();  // 调用ACK处理函数标记为收到
       break;
     default:
       Serial.println("未知的消息类型");
@@ -581,7 +514,7 @@ void loop() {
 
       struct_message msg;
       msg.type = 0x01;                                        // 发送类型
-      msg.num_xiao = ceil(numLedsToLight / (float)PER_LEDS);  // 总需要XIAO的数量
+      msg.num_xiao = ceil(numLedsToLight / (float)PER_LEDS);  // 总需要XIAO的数量  // 总需要XIAO的数量
       msg.num_leds = numLedsToLight % PER_LEDS;               // 灯珠数量
       Serial.print("Need Total XIAO Number: "); Serial.println(msg.num_xiao);
       Serial.print("Need Extra LEDs Number: "); Serial.println(msg.num_leds);
@@ -596,7 +529,6 @@ void loop() {
         int child_id = next_devices[DEVICE_ID][i];
         if(child_id != -1){
           sendMessage(device_macs[child_id], msg);
-          // sendMessageWithAck(device_macs[child_id], msg);
         }
       }
       ready_to_send = false;
