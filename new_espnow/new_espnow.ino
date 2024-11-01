@@ -10,7 +10,7 @@
 // =========================
 
 // 设备编号（0 到 10）
-#define DEVICE_ID 0  // 修改为对应设备的编号（0到10）
+#define DEVICE_ID 4  // 修改为对应设备的编号（0到10）
 
 // 导入必要的库
 #include <esp_now.h>
@@ -25,6 +25,22 @@ LIS3DHTR<TwoWire> LIS; //IIC
 #define WIRE Wire
 #endif
 
+#include <FastLED.h>
+
+/********************************* 灯相关 *********************************/
+const int MAX_LEDS = 59 * 5;       // 总共59*5个灯珠
+const int PER_LEDS = 59;           // 单灯条59个灯珠
+#define LED_PIN D1
+#define BRIGHTNESS 255             // FastLED brightness, 0 (min) to 255 (max)
+CRGB leds[PER_LEDS];
+
+
+/********************************* PIR相关 *********************************/
+#define digital_pir_sensor D0
+const unsigned long motionTimeout = 5000; // 5 seconds
+const int motionCountThreshold = 2;       // PIR触发持续有人的阈值
+bool meteorDirection = true;              // 控制流水灯的流转方向
+bool pir_enabled = true;                  // 全局布尔变量，用于控制PIR是否启用
 
 /********************************* ESP-NOW 相关 *********************************/
 // 定义MAC地址数组
@@ -117,16 +133,12 @@ typedef struct struct_message {
 
 /********************************* 不倒翁相关 FOR XIAO 0 *********************************/
 #if DEVICE_ID == 0
-const int MAX_LEDS = 59 * 5;       // 总共59*5个灯珠
-const int PER_LEDS = 59;           // 单灯条59个灯珠
 const float FORCE_THRESHOLD = 2.1; // 力度阈值,可根据实际情况调整
 const float MAX_THRESHOLD = 3.54;  // 最大力度,可根据实际情况调整
 unsigned long hitStartTime = 0;    // 记录击打开始的时间
 float magnitudeSum = 0;            // 存储击打期间所有幅度值的总和
 int magnitudeCount = 0;            // 记录击打期间的幅度值数量
 #endif
-
-
 
 
 /********************************* ESP-NOW 相关函数 *********************************/
@@ -167,34 +179,74 @@ void onDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incoming
   // 处理消息
   switch(msg.type) {
     case 0x01:  // 发送消息
-      // 如果有下一个设备，转发消息
-      for(int i = 0; i < num_next_devices[DEVICE_ID]; i++){
-        int child_id = next_devices[DEVICE_ID][i];
-        if(child_id != -1){
-          sendMessage(device_macs[child_id], msg);
-          Serial.printf("设备%d转发消息给设备%d\n", DEVICE_ID, child_id);
+      // 禁用PIR，以便执行不倒翁灯效
+      pir_enabled = false;
+      setAll(leds, PER_LEDS, 0, 0, 0);
+      if (msg.num_xiao - 1 > 0) {
+        // num_xiao-1 > 0，当前设备需要点亮整条灯条
+        Serial.printf("设备%d点亮整条灯条\n", DEVICE_ID);
+        fadeInRandom(leds, PER_LEDS, 1);  // 使用 fadeInRandom 点亮整条灯带
+
+        // 继续传递消息给下一个设备，减 1 后传递
+        msg.num_xiao -= 1;
+        for (int i = 0; i < num_next_devices[DEVICE_ID]; i++) {
+          int child_id = next_devices[DEVICE_ID][i];
+          if (child_id != -1) {
+            sendMessage(device_macs[child_id], msg);
+            Serial.printf("设备%d转发消息给设备%d\n", DEVICE_ID, child_id);
+          }
+        }
+      } else {
+        // num_xiao-1 <= 0，当前设备只需要点亮 msg.num_leds 个灯珠
+        Serial.printf("设备%d点亮%d个灯珠\n", DEVICE_ID, msg.num_leds);
+        fadeInRandom(leds, msg.num_leds, 1);  // 使用 fadeInRandom 只点亮 msg.num_leds 个灯珠
+
+        // 继续传递消息给下一个设备，依然传递 num_xiao = 0
+        msg.num_xiao -= 1;
+        msg.num_leds = 0;
+        for (int i = 0; i < num_next_devices[DEVICE_ID]; i++) {
+          int child_id = next_devices[DEVICE_ID][i];
+          if (child_id != -1) {
+            sendMessage(device_macs[child_id], msg);
+            Serial.printf("设备%d转发消息给设备%d\n", DEVICE_ID, child_id);
+          }
         }
       }
+
       // 如果没有下一个设备（即最终设备），开始回传
       if(num_next_devices[DEVICE_ID] == 0){
-          struct_message reply;
-          reply.type = 0x02; // 回传消息
-          reply.num_xiao = 0;
-          reply.num_leds = 0;
-          // 发送回上一个设备
-          sendMessage(device_macs[prev_devices[DEVICE_ID][0]], reply);
-          Serial.printf("设备%d发送回传消息给设备%d\n", DEVICE_ID, prev_devices[DEVICE_ID][0]);
+        Serial.printf("设备%d为叶子设备，等待两秒后开始回传\n", DEVICE_ID);
+        delay(2000);
+
+        struct_message reply;
+        reply.type = 0x02; // 回传消息
+        reply.num_xiao = 0;
+        reply.num_leds = 0;
+
+        // 回传给上一个设备
+        for (int i = 0; i < num_prev_devices[DEVICE_ID]; i++) {
+          int parent_id = prev_devices[DEVICE_ID][i];
+          if (parent_id != -1) {
+            sendMessage(device_macs[parent_id], reply);
+            Serial.printf("设备%d回传消息给设备%d\n", DEVICE_ID, parent_id);
+          }
+        }
+        // 执行逐个熄灯效果
+        fadeOutReverse(leds, PER_LEDS, 10);
       }
       break;
+
     case 0x02:  // 回传消息
       // 如果有上一个设备，回传消息
       if(prev_devices[DEVICE_ID][0] != -1){
         sendMessage(device_macs[prev_devices[DEVICE_ID][0]], msg);
         Serial.printf("设备%d回传消息给设备%d\n", DEVICE_ID, prev_devices[DEVICE_ID][0]);
+        // 执行逐个熄灯效果
+        fadeOutReverse(leds, PER_LEDS, 10);
       }
       else{
         // 如果是0号设备，标记收到回传消息
-        #if DEVICE_ID == 0
+#if DEVICE_ID == 0
         reply_count++;
         Serial.printf("0号设备收到第%d个回传回复\n", reply_count);
         // if(reply_count >= 2){ // 0号设备同时接收来自1和6的回传
@@ -203,8 +255,9 @@ void onDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incoming
           reply_count = 0;
           Serial.println("0号设备已收到所有回传回复，准备发送下一次消息");
         }
-        #endif
+#endif
       }
+      pir_enabled = true;  // 不倒翁灯效执行完毕，重新启用PIR
       break;
     default:
       Serial.println("未知的消息类型");
@@ -215,6 +268,7 @@ void onDataReceive(const esp_now_recv_info_t *recv_info, const uint8_t *incoming
 
 /********************************* 灯相关函数 *********************************/
 // 计算需要点亮的LED数量
+#if DEVICE_ID == 0
 int calculateNumLedsToLight(float avgMagnitude) {
   if (avgMagnitude >= MAX_THRESHOLD) {
     return MAX_LEDS;
@@ -223,6 +277,129 @@ int calculateNumLedsToLight(float avgMagnitude) {
   } else {
     float ratio = (avgMagnitude - FORCE_THRESHOLD) / (MAX_THRESHOLD - FORCE_THRESHOLD);
     return round(ratio * (MAX_LEDS - 1)) + 2;  // 使用round函数四舍五入,并确保至少点亮1个LED
+  }
+}
+#endif
+
+// 一次性设置所有的灯珠
+void setAll(CRGB *leds, int numLeds, byte red, byte green, byte blue) {
+  for(int i = 0; i < numLeds; i++ ) {
+    setPixel(leds, i, red, green, blue);
+  }
+  showStrip();
+}
+
+// 设置单颗灯颜色
+void setPixel(CRGB *leds, int Pixel, byte red, byte green, byte blue) {
+  leds[Pixel] = CRGB(red, green, blue);
+}
+
+// 显示
+void showStrip() {
+  FastLED.show();
+}
+
+void fadeToBlack(CRGB *leds, int ledNo, byte fadeValue) {
+  leds[ledNo].fadeToBlackBy(fadeValue);
+}
+
+// PIR 流水灯效
+void meteorRain(CRGB *leds, int numLeds, byte meteorSize, byte meteorTrailDecay, boolean meteorRandomDecay, int SpeedDelay, bool rightToLeft) {  
+  setAll(leds, numLeds, 0, 0, 0);
+  for(int i = 0; i < numLeds+numLeds; i++) {
+    // fade brightness all LEDs one step
+    for(int j=0; j<numLeds; j++) {
+      if( (!meteorRandomDecay) || (random(10)>5) ) {
+        fadeToBlack(leds, j, meteorTrailDecay );        
+      }
+    }
+    // draw meteor
+    for(int j = 0; j < meteorSize; j++) {
+      if(rightToLeft) {
+        if( ( i-j <numLeds) && (i-j>=0) ) {
+          setPixel(leds, i-j, random(256), random(256), random(256));
+        }
+      } else {
+        if( ( i-j <numLeds) && (i-j>=0) ) {
+          setPixel(leds, numLeds-1-(i-j), random(256), random(256), random(256));
+        }
+      }
+    }
+    showStrip();
+    delay(SpeedDelay);
+  }
+}
+
+// 作为不倒翁击倒灯效，随机颜色逐颗点亮
+void fadeInRandom(CRGB *leds, int numLeds, int delayTime) {
+  for (int i = 0; i < numLeds; i++) {
+    byte red = random(256);
+    byte green = random(256);
+    byte blue = random(256);
+    
+    for (int j = 0; j < 256; j += 15) {
+      setPixel(leds, i, red * j / 255, green * j / 255, blue * j / 255);
+      showStrip();
+    }
+    delay(delayTime);
+  }
+}
+
+// 逐颗熄灭LED
+void fadeOutReverse(CRGB *leds, int numLeds, int delayTime) {
+  for (int i = numLeds - 1; i >= 0; i--) {
+    for (int j = 0; j < 256; j += 15) {
+      setPixel(leds, i, leds[i].red * (255 - j) / 255, leds[i].green * (255 - j) / 255, leds[i].blue * (255 - j) / 255);
+      showStrip();
+    }
+    delay(delayTime);
+  }
+}
+
+// 不倒翁持续一会的灯效
+// void RunningLights(byte red, byte green, byte blue, int numLeds) {
+void RunningLights(int numLeds) {
+  int Position=0;
+  for(int j = 0; j < numLeds * 2; j++)
+  {
+    Position++; // = 0; //Position + Rate;
+    for(int i=0; i < numLeds; i++) {
+      // sine wave, 3 offset waves make a rainbow!
+      float level = sin(i+Position) * 127 + 128;
+      setPixel(leds, i,level,0,0);
+      // setPixel(i,((sin(i+Position) * 127 + 128)/255)*red,
+      //             ((sin(i+Position) * 127 + 128)/255)*green,
+      //             ((sin(i+Position) * 127 + 128)/255)*blue);
+    }
+    showStrip();
+    delay(500);
+  }
+}
+
+
+/********************************* PIR函数 *********************************/
+int motionCount = 0;                    // 用于一直有人时持续触发的灯光效果
+unsigned long lastMotionTime = 0;       // 用于避免同一次PIR反复触发灯光效果
+
+void handlePIR(int pirSensor, CRGB *leds, int numLeds) {
+  bool state = digitalRead(pirSensor); // read from PIR sensor
+  if (state == 1) {
+    Serial.println("A Motion has occured on PIR sensor.");
+    motionCount++;
+    if (motionCount >= motionCountThreshold) {
+      meteorRain(leds, numLeds, 10, 64, true, 30, meteorDirection);
+      meteorDirection = !meteorDirection;
+    } else {
+        meteorDirection = true;
+        meteorRain(leds, numLeds, 10, 64, true, 30, meteorDirection);
+      }
+    
+    lastMotionTime = millis();
+  }
+  else if (millis() - lastMotionTime > motionTimeout) {
+    Serial.println("Nothing Happened on PIR sensor.");
+    motionCount = 0;
+    // setAll(leds, numLeds, 0, 0, 0); // Turn off all LEDs when no motion is detected
   }
 }
 
@@ -294,6 +471,11 @@ void setup() {
   LIS.setFullScaleRange(LIS3DHTR_RANGE_2G);
   LIS.setOutputDataRate(LIS3DHTR_DATARATE_50HZ);
   ready_to_send = true;
+#else
+  pinMode(digital_pir_sensor, INPUT); // set Pin mode as input
+  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, PER_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);  // 确保灯带初始化后所有灯关闭
+  setAll(leds, PER_LEDS, 0, 0, 0);
 #endif
 
   Serial.print("XIAO "); Serial.print(DEVICE_ID); Serial.print(" "); Serial.println("Ready!");
@@ -352,9 +534,11 @@ void loop() {
       ready_to_send = false;
     }
   }
+#else
+  if (pir_enabled) {
+    // 仅当PIR启用时，执行PIR处理
+    handlePIR(digital_pir_sensor, leds, PER_LEDS);
+  }
 #endif
-
-  // 可以添加其他逻辑，如用户输入触发发送等
-
-  delay(100);
+  delay(10);
 }
